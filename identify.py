@@ -23,7 +23,8 @@ except Exception:
 
 import win32con
 import win32gui
-from PIL import ImageGrab
+import win32ui
+from PIL import Image
 
 WINDOW_TITLE = '扫雷'
 
@@ -60,16 +61,48 @@ def _scale_for(win_rect=None, img=None) -> float:
 
 
 def grab_window(title: str = WINDOW_TITLE):
-    """截取窗口。三个坑：最小化时 rect 为 -25600；必须 all_screens；先设 DPI。"""
+    """截取窗口，返回 (PIL.Image, rect)。
+
+    **用 BitBlt 抓窗口自身的 DC，不要用 ImageGrab.grab(bbox=...)。**
+    实测（本机 4K@200%，进程设了 PER_MONITOR_DPI_AWARE）：
+      - ImageGrab.grab(bbox, all_screens=True) 抓回来的是**完全错误的区域** ——
+        对照 UIA 真值 480 格**全错**。这正是「像素识别不准」的真正根源，
+        不是阈值标得不好；
+      - 而且慢 12 倍：92ms vs BitBlt 的 7.8ms。
+    BitBlt 从窗口 DC 取像素，不受遮挡影响，也不经过 DPI 坐标换算。
+
+    另外两个坑：最小化时 GetWindowRect 为 -25600；必须先设 DPI 感知（见文件头）。
+    """
     h = win32gui.FindWindow(None, title)
     if not h:
         raise RuntimeError(f'找不到窗口 {title!r}，扫雷启动了吗？')
-    win32gui.ShowWindow(h, win32con.SW_RESTORE)
-    time.sleep(0.08)
+    # 只有真从最小化恢复时才需要等；窗口正常时这 80ms 是白等（实测它占了
+    # grab_window 总耗时的 2/3：125ms -> 15ms）
+    if win32gui.IsIconic(h):
+        win32gui.ShowWindow(h, win32con.SW_RESTORE)
+        time.sleep(0.08)
     l, t, r, b = win32gui.GetWindowRect(h)
     if l < -10000:
         raise RuntimeError('窗口仍是最小化状态')
-    return ImageGrab.grab(bbox=(l, t, r, b), all_screens=True), (l, t, r, b)
+    w, hh = r - l, b - t
+    hwndDC = win32gui.GetWindowDC(h)
+    mfcDC = win32ui.CreateDCFromHandle(hwndDC)
+    saveDC = mfcDC.CreateCompatibleDC()
+    bmp = win32ui.CreateBitmap()
+    try:
+        bmp.CreateCompatibleBitmap(mfcDC, w, hh)
+        saveDC.SelectObject(bmp)
+        saveDC.BitBlt((0, 0), (w, hh), mfcDC, (0, 0), win32con.SRCCOPY)
+        info = bmp.GetInfo()
+        # GetBitmapBits 返回的是拷贝，所以下面可以立刻释放 GDI 对象
+        img = Image.frombuffer('RGB', (info['bmWidth'], info['bmHeight']),
+                               bmp.GetBitmapBits(True), 'raw', 'BGRX', 0, 1)
+    finally:
+        win32gui.DeleteObject(bmp.GetHandle())
+        saveDC.DeleteDC()
+        mfcDC.DeleteDC()
+        win32gui.ReleaseDC(h, hwndDC)
+    return img, (l, t, r, b)
 
 
 def _digit(blk: np.ndarray):
@@ -113,10 +146,17 @@ def _analyze(blk: np.ndarray) -> str:
     # 红底格（雷区标红），不能当数字用
     if red > 0.50 and blue < 0.30:
         return '?'
-    # 未开格与旗子：底色（蓝）几乎铺满整格，旗子则是「蓝底 + 一块红旗」。
-    # 用 blue+red 而不是单独 blue：旗子的红旗会占掉一部分蓝，单看 blue 会漏。
-    # 阈值 0.85 又刚好把“深蓝色笔画粗的数字 4”挡在外面（它 blue≈0.64）。
-    if blue + red > 0.85:
+    # 旗子：蓝底 + 一块红旗。**必须按 red 单独判，不能靠 blue+red 当闸门**：
+    # 实测旗子的 blue+red 只有 0.738~0.805（低于原来的 0.85 闸门），于是掉进
+    # 数字分支被读成 '1' —— 6 面旗 6 面全错。旗子读错的后果很严重：
+    # solver 会以为雷已标全，chord 展开直接踩雷。
+    # 注意数字 3/5 本身也是红的（red 0.219~0.234，比旗子还红），但它们的
+    # blue 只有 0.057~0.230，而旗子是 0.613~0.685 —— 判据是「有红 且 蓝底还在」。
+    if red > 0.05 and blue > 0.45:
+        return 'F'
+    # 未开格：蓝底几乎铺满（实测 blue 0.856~0.941）。阈值从 0.85 降到 0.75 留余量
+    # （数字 1 的 blue 最高才 0.603，不会误判）。
+    if blue + red > 0.75:
         return 'F' if red > FLAG_RED_RATIO else '#'
     d = _digit(blk)
     return str(d) if d is not None else '.'
