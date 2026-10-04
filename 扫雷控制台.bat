@@ -1,4 +1,10 @@
 @echo off
 chcp 65001 >nul
 cd /d "%~dp0"
-start "" "D:\software\Anaconda3\pythonw.exe" "%~dp0ms_gui.py"
+call "%~dp0_find_python.bat"
+if not defined PY (
+  echo [ERROR] Python not found. Edit _find_python.bat and add your python.exe path.
+  pause
+  exit /b 1
+)
+start "" "%PYW%" "%~dp0ms_gui.py"

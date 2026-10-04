@@ -3,7 +3,8 @@
 安全设计（控制真实鼠标，必须保守）
 ---------------------------------
 1. --dry（默认）：只识别 + 决策 + 打印将要点的屏幕坐标，一个键都不按。
-2. 急停：把鼠标移到屏幕左上角 (0,0)–(6,6) 区域，循环立即退出。
+2. 急停（两个通道，任一命中立即退出）：① 按下 Win 键（左/右均可）；
+   ② 把鼠标移到屏幕左上角 (0,0)–(6,6) 区域。
 3. 坐标校验：每次点击前确认目标落在扫雷窗口 rect 内，否则拒绝执行。
 4. 单步限速：一次只动一格，动作后等界面刷新再重新识别，不批量连点。
 5. 步数上限 + 全程日志：每步写 log/step-*.jsonl，出事能回看。
@@ -18,6 +19,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import sys
@@ -26,6 +28,7 @@ import time
 import win32api
 import win32con
 import win32gui
+import win32process
 
 import paths
 
@@ -38,21 +41,55 @@ WINDOW_TITLE = '扫雷'
 LOG_DIR = paths.data('log')          # 开发时=脚本目录\log；打包后=exe 旁边\log
 os.makedirs(LOG_DIR, exist_ok=True)
 STOP_ZONE = 6          # 左上角 6x6 像素 = 急停区
+# 急停按键：VK_LWIN / VK_RWIN。用 GetAsyncKeyState 轮询物理键状态，
+# 不注册全局热键、不抢占系统 Win 键本身的功能。
+STOP_KEYS = ((0x5B, 'Win 键'), (0x5C, '右 Win 键'))
+# 同一个格子连续插旗失败这么多次就停手。坐标错位/窗口被遮挡时，没有熔断会无限重试。
+FLAG_FAIL_LIMIT = 3
 OPEN_DELAY = 0.32      # 点开后等界面刷新（扫雷有展开动画）
 FLAG_DELAY = 0.20
 
 
-def ensure_ready(hwnd: int) -> None:
-    """确保窗口可接收鼠标输入（UIA 的 Invoke 不依赖焦点，只有插旗/chord 需要）。"""
+def ensure_ready(hwnd: int) -> bool:
+    """确保窗口可接收鼠标输入（UIA 的 Invoke 不依赖焦点，只有插旗/chord 需要）。
+
+    **返回是否确认已在前台。** 为什么要回读校验：SetForegroundWindow 会被
+    Windows 前台锁定**静默拒绝**（不抛异常、返回 None），不校验的话就表现为
+    「右键点了没反应、旗子永远插不上」，而且会一直重试。
+    实测后台投递（PostMessage WM_RBUTTONDOWN/UP）经典扫雷不认，所以只能走真实鼠标，
+    也就必须真的把它置前。
+    """
     if win32gui.IsIconic(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
         time.sleep(0.35)
+    if win32gui.GetForegroundWindow() == hwnd:
+        return True
+    # 第一次：常规尝试
     try:
-        if win32gui.GetForegroundWindow() != hwnd:
-            win32gui.SetForegroundWindow(hwnd)
-            time.sleep(0.06)
+        win32gui.SetForegroundWindow(hwnd)
+        time.sleep(0.06)
     except Exception:
         pass
+    if win32gui.GetForegroundWindow() == hwnd:
+        return True
+    # 第二次：借用当前前台线程的输入队列，绕过前台锁定
+    try:
+        fg = win32gui.GetForegroundWindow()
+        fg_thread = win32process.GetWindowThreadProcessId(fg)[0]
+        my_thread = win32api.GetCurrentThreadId()
+        attached = False
+        if fg_thread and fg_thread != my_thread:
+            attached = bool(ctypes.windll.user32.AttachThreadInput(fg_thread, my_thread, True))
+        try:
+            win32gui.BringWindowToTop(hwnd)
+            win32gui.SetForegroundWindow(hwnd)
+        finally:
+            if attached:
+                ctypes.windll.user32.AttachThreadInput(fg_thread, my_thread, False)
+        time.sleep(0.08)
+    except Exception:
+        pass
+    return win32gui.GetForegroundWindow() == hwnd
 
 
 def click(x: int, y: int, right: bool = False, both: bool = False) -> None:
@@ -148,9 +185,28 @@ def dismiss_game_over() -> bool:
     return True
 
 
-def stopped() -> bool:
+def stop_reason():
+    """急停检测。命中返回原因字符串，未命中返回 None。
+
+    两个通道，任一命中即停：
+      1) 按下 Win 键（左/右都认）。**这是主通道** —— 代理自己在动鼠标，
+         原来的鼠标通道在代理点击期间会被它自己占用，用户根本抢不到。
+      2) 鼠标移到屏幕左上角 STOP_ZONE x STOP_ZONE 区域（原有通道，保留）。
+
+    用 GetAsyncKeyState 轮询物理键状态：不注册全局热键（注册 Win 组合键会
+    抢掉系统自身的 Win 功能），也不依赖窗口焦点（UIA 点击时焦点不在本进程）。
+    """
+    for vk, name in STOP_KEYS:
+        if win32api.GetAsyncKeyState(vk) & 0x8000:
+            return f'按下了 {name}'
     x, y = win32api.GetCursorPos()
-    return x < STOP_ZONE and y < STOP_ZONE
+    if x < STOP_ZONE and y < STOP_ZONE:
+        return f'鼠标移到左上角 {STOP_ZONE}x{STOP_ZONE}'
+    return None
+
+
+def stopped() -> bool:
+    return stop_reason() is not None
 
 
 def log_step(step: int, payload: dict) -> None:
@@ -523,6 +579,25 @@ def read_cells(cells):
     return u.grid()
 
 
+def click_point_for(r: int, c: int, rect):
+    """格子中心的屏幕坐标 —— **优先用 UIA 的 BoundingRectangle**。
+
+    为什么不能用 identify.cell_center()：那套 X0/Y0/CW/CH 是按 100% 缩放标定的
+    （标定窗口 669x440 = 逻辑尺寸），而本进程设了 PER_MONITOR_DPI_AWARE，
+    GetWindowRect 返回的是**物理像素**。两者混用，在高 DPI 下会把坐标算偏约 2 倍
+    —— 本机 4K@200% 实测：想点 (8,15) 实际点到 (2,6)，表现就是「旗子永远插不上」，
+    而开格走 UIA Invoke 不用坐标，所以看起来只有插旗/chord 坏。
+    UIA 的 BoundingRectangle 是物理像素、跟 DPI 无关、每台机器都对。
+    """
+    u = _READER['uia']
+    if u is not None:
+        try:
+            return u.click_point(r, c)
+        except Exception:
+            pass
+    return cell_center(r, c, rect)      # 回退：像素识别通道（identify 已按 DPI 缩放）
+
+
 def open_cell(r: int, c: int, rect) -> str:
     """开一格。UIA 优先用 InvokePattern（**不碰鼠标、不依赖焦点**），否则坐标点击。"""
     u = _READER['uia']
@@ -535,7 +610,7 @@ def open_cell(r: int, c: int, rect) -> str:
 
 def flag_cell(r: int, c: int, rect) -> bool:
     """插旗（UIA 没右键通道，只能鼠标），插完用 UIA 验证一下。"""
-    x, y = cell_center(r, c, rect)
+    x, y = click_point_for(r, c, rect)
     click(x, y, right=True)
     u = _READER['uia']
     if u is not None:
@@ -555,6 +630,7 @@ def play_game(hwnd, dry, allow_guess, max_steps, remaining, game_no=1):
     open_fail = 0                # 连续 open 失效（真正的游戏结束信号）
     chord_fail = 0               # 连续 chord 失效
     flag_fail = 0                # 连续插旗失效
+    flag_fail_count: dict = {}   # 格子 -> 连续插旗失败次数（熔断用）
     disable_chord = False        # 双键 chord 实测有效（之前失败是选错了“雷没标全”的格子）
     anchor = None                # 锚点：上次 chord 的位置（贪吃蛇式就地推进）
     grid = None                  # 缓存的棋盘：上一步末尾更新，避免开头重复读
@@ -582,8 +658,10 @@ def play_game(hwnd, dry, allow_guess, max_steps, remaining, game_no=1):
         if handled:
             print(f'[{step}] 处理模态框：{handled}（保住当前局）')
             continue
-        if stopped():
-            print('★ 检测到急停（鼠标在左上角），退出')
+        why = stop_reason()
+        if why:
+            print(f'★ 检测到急停（{why}），退出')
+            log_step(step, {'action': 'estop', 'reason': why})
             return 'stuck', done
         ensure_ready(hwnd)
         if grid is None:
@@ -611,12 +689,18 @@ def play_game(hwnd, dry, allow_guess, max_steps, remaining, game_no=1):
                 time.sleep(0.5)
                 continue
             if _mines:
+                # 插旗走真实鼠标 → 必须确认窗口真的在最前面（SetForegroundWindow 会静默失败）
+                if not ensure_ready(hwnd):
+                    print(f'[{step}] ⚠ 扫雷窗口未能置前（插旗走真实鼠标，可能失效）')
                 todo = sorted(_mines)
                 print(f'[{step}] 批量标雷 {len(todo)} 个：{todo[:6]}{" ..." if len(todo) > 6 else ""}')
                 for m in todo:
-                    if stopped():
+                    why = stop_reason()
+                    if why:
+                        print(f'★ 检测到急停（{why}），退出')
+                        log_step(step, {'action': 'estop', 'reason': why})
                         return 'stuck', done
-                    mx, my = cell_center(*m, rect)
+                    mx, my = click_point_for(*m, rect)
                     if not (rect[0] <= mx <= rect[2] and rect[1] <= my <= rect[3]):
                         continue
                     click(mx, my, right=True)
@@ -637,9 +721,29 @@ def play_game(hwnd, dry, allow_guess, max_steps, remaining, game_no=1):
                 if missed:
                     print(f'      ⚠ {len(missed)} 个旗子确实没插上：{missed[:5]}（补一次）')
                     for m in missed:
-                        mx, my = cell_center(*m, rect)
+                        mx, my = click_point_for(*m, rect)
                         click(mx, my, right=True)
                         time.sleep(0.06)
+                    # 补完再验一次，并给「同一个格子连续失败」计数。
+                    # 没有这道熔断，坐标错位时会一直原地重试（实测空转 445 步把这一局点输）。
+                    time.sleep(0.25)
+                    grid = read_cells(missed)
+                    still = [m for m in missed if grid[m[0]][m[1]] != 'F']
+                    for m in missed:
+                        if m in still:
+                            flag_fail_count[m] = flag_fail_count.get(m, 0) + 1
+                        else:
+                            flag_fail_count.pop(m, None)
+                    if still and max(flag_fail_count[m] for m in still) >= FLAG_FAIL_LIMIT:
+                        print(f'★ 同一批格子连续 {FLAG_FAIL_LIMIT} 次插旗无效：{still[:3]}，停手')
+                        print('  开格走 UIA Invoke 不依赖坐标，所以照常能用；')
+                        print('  插旗/chord 依赖真实鼠标坐标 —— 坐标错位或窗口被遮挡时会一直失败。')
+                        log_step(step, {'action': 'flag-giveup',
+                                        'cells': [list(m) for m in still]})
+                        return 'stuck', done
+                else:
+                    for m in todo:
+                        flag_fail_count.pop(m, None)
                 continue
 
         try:
@@ -663,7 +767,7 @@ def play_game(hwnd, dry, allow_guess, max_steps, remaining, game_no=1):
             log_step(step, {'action': 'stop', 'reason': reason})
             return 'stuck', done
         rr, cc = cell
-        x, y = cell_center(rr, cc, rect)
+        x, y = click_point_for(rr, cc, rect)
         if not (rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]):
             print(f'[{step}] ★ 拒绝执行：坐标 ({x},{y}) 不在窗口内')
             log_step(step, {'action': 'refuse', 'cell': cell, 'xy': [x, y]})
@@ -731,7 +835,7 @@ def run(dry: bool, allow_guess: bool, max_steps: int, remaining: int | None, loo
     hwnd = win32gui.FindWindow(None, WINDOW_TITLE)
     print(f'模式: {"DRY（不点击）" if dry else "实点"}  '
           f'赌博: {"允许" if allow_guess else "禁止"}  '
-          f'最多 {loop} 局  急停: 鼠标移到左上角 {STOP_ZONE}x{STOP_ZONE}')
+          f'最多 {loop} 局  急停: 按 Win 键 或 鼠标移到左上角 {STOP_ZONE}x{STOP_ZONE}')
     results = {}
     for game in range(1, loop + 1):
         print(f'\n===== 第 {game} 局 =====')

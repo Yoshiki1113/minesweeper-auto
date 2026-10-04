@@ -15,3 +15,10 @@ gui_debug.txt
 
 # 临时截图与中间产物
 *.tmp
+
+# 随包携带的微软扫雷本体（本地运行/打包需要，但不入库：
+# 微软版权二进制 + 5.3MB 体积；打包时 .spec 会从磁盘读，不受本规则影响）
+Minesweeper.exe
+Minesweeper.dll
+slc.dll
+zh-CN/

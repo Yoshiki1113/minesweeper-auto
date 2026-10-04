@@ -39,6 +39,25 @@ FLAG_RED_RATIO = 0.03
 SAT_MIN = 55                 # 判数字笔画的最低饱和度
 MIN_DIGIT_PIXELS = 6         # 一个数字至少要这么多饱和像素
 
+# 标定时的**窗口宽度**。上面那套 X0/Y0/CW/CH 是在这个尺寸下量出来的，
+# 而它等于逻辑尺寸（100% 缩放）。本机 4K@200% 时窗口物理宽度是 1333，
+# 比值 ≈ 1.98 —— 不缩放的话算出来的坐标会偏约 2 倍（实测点 (8,15) 点到 (2,6)）。
+CAL_WIN_W = 669.0
+
+
+def _scale_for(win_rect=None, img=None) -> float:
+    """当前窗口相对标定尺寸的缩放比（高 DPI 修正）。拿不到窗口信息就返回 1.0。"""
+    w = None
+    if win_rect:
+        w = win_rect[2] - win_rect[0]
+    elif img is not None:
+        w = img.size[0]
+    if not w:
+        return 1.0
+    s = w / CAL_WIN_W
+    # 边框/主题带来的几个像素差异不缩放，避免抖动
+    return s if abs(s - 1.0) > 0.05 else 1.0
+
 
 def grab_window(title: str = WINDOW_TITLE):
     """截取窗口。三个坑：最小化时 rect 为 -25600；必须 all_screens；先设 DPI。"""
@@ -105,24 +124,32 @@ def _analyze(blk: np.ndarray) -> str:
 
 def read_board(img=None):
     """返回 16x30 的字符矩阵。"""
+    rect = None
     if img is None:
-        img, _ = grab_window()
+        img, rect = grab_window()
+    s = _scale_for(rect, img)          # 高 DPI 修正：本机 200% 时 s≈2
+    pad = max(1, int(round(2 * s)))
     a = np.asarray(img.convert('RGB')).astype(int)
     grid = []
     for rr in range(ROWS):
         row = []
         for cc in range(COLS):
-            y1, x1 = int(Y0 + rr * CH), int(X0 + cc * CW)
-            blk = a[y1 + 2:y1 + int(CH) - 1, x1 + 2:x1 + int(CW) - 1]
+            y1, x1 = int((Y0 + rr * CH) * s), int((X0 + cc * CW) * s)
+            blk = a[y1 + pad:y1 + int(CH * s) - 1, x1 + pad:x1 + int(CW * s) - 1]
             row.append(_analyze(blk))
         grid.append(row)
     return grid
 
 
 def cell_center(rr: int, cc: int, win_rect=None):
-    """格子 → 屏幕像素坐标（点击用）。"""
-    x = X0 + (cc + 0.5) * CW
-    y = Y0 + (rr + 0.5) * CH
+    """格子 → 屏幕像素坐标（点击用）。
+
+    ⚠️ 注意：agent 的鼠标路径**优先用 UIA 的 BoundingRectangle**（见 agent.click_point_for），
+    这个函数只是没有 UIA 时的回退。win_rect 必须是**和本进程 DPI 感知一致**的物理坐标。
+    """
+    s = _scale_for(win_rect)
+    x = (X0 + (cc + 0.5) * CW) * s
+    y = (Y0 + (rr + 0.5) * CH) * s
     if win_rect:
         x += win_rect[0]
         y += win_rect[1]
