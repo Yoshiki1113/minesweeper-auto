@@ -213,6 +213,22 @@ class UiaBoard:
         rect = e.CachedBoundingRectangle
         return (rect.left + rect.right) // 2, (rect.top + rect.bottom) // 2
 
+    def cell_rects(self) -> Dict[Cell, Tuple[int, int, int, int]]:
+        """每个格子的屏幕矩形 (left, top, right, bottom)，物理像素。
+
+        给像素通道**反标定**几何用：硬编码那套 X0/Y0/CW/CH 是按 669x440 的窗口
+        量的，而本机实际格子 39.4px、公式给出 39.19px —— 0.5% 的缩放误差在 30 列
+        上累积成 6.3px 漂移，足以把数字笔画挤出采样块。
+        """
+        out: Dict[Cell, Tuple[int, int, int, int]] = {}
+        for (r, c), e in self.elements.items():
+            try:
+                rc = e.CachedBoundingRectangle
+            except Exception:
+                continue
+            out[(r, c)] = (rc.left, rc.top, rc.right, rc.bottom)
+        return out
+
     def invoke(self, r: int, c: int, pattern: str = 'invoke') -> bool:
         """直接调用元件操作（**不移动真实鼠标、不依赖窗口焦点**）。
 

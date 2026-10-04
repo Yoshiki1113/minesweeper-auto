@@ -60,6 +60,37 @@ def _scale_for(win_rect=None, img=None) -> float:
     return s if abs(s - 1.0) > 0.05 else 1.0
 
 
+def calibrate_from_rects(cell_rects, win_rect):
+    """用 UIA 给的格子矩形**反标定** X0/Y0/CW/CH，返回 (X0, Y0, CW, CH)。
+
+    为什么需要：上面那套硬编码值是按 669x440 的窗口量的，而本机实际格子是 39.4px、
+    公式给出 39.19px —— 0.5% 的缩放误差在 30 列上累积成 6.3px 漂移，足以把数字笔画
+    挤出采样块（实测整盘准确率因此掉到 85%）。
+
+    cell_rects: {(r,c): (left, top, right, bottom)}，物理像素
+    win_rect:   窗口矩形，物理像素
+    标定结果归一到「窗口宽 = CAL_WIN_W」的逻辑坐标，这样 _scale_for 那套仍然适用。
+    """
+    global X0, Y0, CW, CH
+    l, t, r_, b_ = win_rect
+    w = r_ - l
+    if w <= 0 or len(cell_rects) < 100:
+        return X0, Y0, CW, CH
+    k = CAL_WIN_W / w                      # 物理 -> 逻辑
+    cols, xs, rows, ys = [], [], [], []
+    for (rr, cc), (el, et, er, eb) in cell_rects.items():
+        cols.append(cc)
+        xs.append(((el + er) / 2 - l) * k)
+        rows.append(rr)
+        ys.append(((et + eb) / 2 - t) * k)
+    cw, x_int = np.polyfit(cols, xs, 1)    # 中心 = (X0 + 0.5*CW) + c*CW
+    ch, y_int = np.polyfit(rows, ys, 1)
+    X0 = float(x_int - 0.5 * cw)
+    Y0 = float(y_int - 0.5 * ch)
+    CW, CH = float(cw), float(ch)
+    return X0, Y0, CW, CH
+
+
 def grab_window(title: str = WINDOW_TITLE):
     """截取窗口，返回 (PIL.Image, rect)。
 
@@ -123,13 +154,20 @@ def _digit(blk: np.ndarray):
     r, g, b = core[:, 0].mean(), core[:, 1].mean(), core[:, 2].mean()
     lum = (r + g + b) / 3
     if r > g and r > b:                      # 红系：3 亮 / 5 暗
-        return 3 if lum > 65 else 5
+        # 阈值 65 是错的：实测（整局 108 次比对、2619 个 3 的样本）
+        #   数字 3 的核心亮度 lum = 61.9 ~ 63.0
+        #   数字 5 的核心亮度 lum = 42.5 ~ 43.1
+        # 65 把**所有** 3 都判成了 5（曾占全部像素误读的 92%）。取中点 52。
+        return 3 if lum > 52 else 5
+    # 青 = 6。**必须放在蓝系判断之前**：数字 6 的核心是 (6,124,128)，B 只比 G 高 4，
+    # 会被下面的「b > g」分支抢走判成 1（实测 87 个 6 全错）。
+    # 数字 1(64,81,190)/4(3,4,131) 的 |G-B| 都 >100，不会误判成 6。
+    if g > r and b > r and abs(g - b) < 35:
+        return 6
     if g > r and g > b:                      # 绿 = 2
         return 2
     if b > r and b > g:                      # 蓝系：1 亮 / 4 深
         return 1 if lum > 65 else 4
-    if g > r and abs(g - b) < 35:            # 青 = 6
-        return 6
     return None
 
 
@@ -146,13 +184,15 @@ def _analyze(blk: np.ndarray) -> str:
     # 红底格（雷区标红），不能当数字用
     if red > 0.50 and blue < 0.30:
         return '?'
-    # 旗子：蓝底 + 一块红旗。**必须按 red 单独判，不能靠 blue+red 当闸门**：
-    # 实测旗子的 blue+red 只有 0.738~0.805（低于原来的 0.85 闸门），于是掉进
-    # 数字分支被读成 '1' —— 6 面旗 6 面全错。旗子读错的后果很严重：
-    # solver 会以为雷已标全，chord 展开直接踩雷。
-    # 注意数字 3/5 本身也是红的（red 0.219~0.234，比旗子还红），但它们的
-    # blue 只有 0.057~0.230，而旗子是 0.613~0.685 —— 判据是「有红 且 蓝底还在」。
-    if red > 0.05 and blue > 0.45:
+    # 旗子：蓝底 + 一块红旗。
+    # 判据是「有红 且（蓝底还在 或 红占比小到不可能是数字 3）」——
+    # 实测（整局 108 次比对）：
+    #   旗子   red 0.117~0.138（很窄），blue 0.065~0.782
+    #   数字 3 red 0.210~0.241（**比旗子还红**），blue 0.000~0.340
+    #   数字 5 red 0.002~0.045，blue 0.000~0.237
+    # 所以 red 单独就能把旗子(≤0.138)和 3(≥0.210)分开，取 0.18 做分界；
+    # 少数旗子的 blue 只有 0.065（远低于 0.45），靠 red 这一支兜住。
+    if red > 0.05 and (blue > 0.45 or red < 0.18):
         return 'F'
     # 未开格：蓝底几乎铺满（实测 blue 0.856~0.941）。阈值从 0.85 降到 0.75 留余量
     # （数字 1 的 blue 最高才 0.603，不会误判）。

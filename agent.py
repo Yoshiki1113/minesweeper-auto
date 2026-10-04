@@ -34,7 +34,7 @@ import paths
 
 # 开发时脚本同目录可能有 _MEIPASS 解不开的模块；打包后 _MEIPASS 自己就在 sys.path 里。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from identify import COLS, ROWS, cell_center, read_board
+from identify import COLS, ROWS, calibrate_from_rects, cell_center, read_board
 from solver import collect_constraints, certain_moves, probabilities
 
 WINDOW_TITLE = '扫雷'
@@ -51,6 +51,19 @@ FLAG_FAIL_LIMIT = 3
 # 实测同一盘面中位有 10 个格子可 chord —— 取 6 是「省下的读盘」与
 # 「一次读的格数变多」之间的折中。
 CHORD_BATCH = 6
+# 读盘走「像素整盘快读」还是「UIA 增量读」。
+#   像素：一次 BitBlt + 整盘识别 ≈ 33ms，整盘都是新的（不会漂移），
+#         实测整局 108 次比对 / 23520 格 0 处不一致；
+#   UIA ：每格一次跨进程调用 14.24ms，增量读 ~7 格 ≈ 90ms，100% 准。
+#
+# ⚠️ **默认关闭（False）**，因为实测发现一个尚未根治的可靠性问题：
+#    UIA 读盘慢（前沿补读 ~131~700ms）一直在**无意中充当连锁动画的等待时间**。
+#    换成 33ms 的像素读后，代理会冲到动画中间 —— 而**扫雷在连锁动画期间会忽略
+#    鼠标点击**，导致插旗/chord 全部失效（实测连打第 2 局时 5~11 面旗全灭 → 熔断 stuck）。
+#    按变化量自适应补等（15ms/20 次）能救回单局，但多局连打仍会复现，根因未定位。
+#    开启后单局确实更快（85~93 ms/步 vs ~150），但要接受这个风险。
+#    想开：agent.PIXEL_FAST_READ = True，或把下面改成 True。
+PIXEL_FAST_READ = False
 OPEN_DELAY = 0.32      # 点开后等界面刷新（扫雷有展开动画）
 FLAG_DELAY = 0.20
 
@@ -458,7 +471,18 @@ def init_reader(hwnd: int, use_uia: bool = True):
         return None
     try:
         from identify_uia import UiaBoard
-        _READER['uia'] = UiaBoard(hwnd, verbose=True)
+        board = UiaBoard(hwnd, verbose=True)
+        _READER['uia'] = board
+        # 顺手用 UIA 的格子矩形反标定像素通道的几何。硬编码那套是按 669x440 的
+        # 窗口量的，本机实际格子 39.4px、公式给 39.19px，0.5% 误差在 30 列上累积
+        # 成 6.3px 漂移，足以把数字笔画挤出采样块。UIA 反正每次开局都要枚举，免费。
+        try:
+            _x0, _y0, _cw, _ch = calibrate_from_rects(board.cell_rects(),
+                                                      win32gui.GetWindowRect(hwnd))
+            print(f'      像素通道几何已标定: X0={_x0:.2f} Y0={_y0:.2f} '
+                  f'CW={_cw:.3f} CH={_ch:.3f}')
+        except Exception as _e:
+            print(f'      像素通道标定跳过（{type(_e).__name__}: {_e}）')
         print('感知层：UIA（首次全量枚举一次；之后只增量重读未开格）')
     except Exception as exc:
         print(f'UIA 初始化失败（{type(exc).__name__}: {exc}）→ 回退像素识别')
@@ -501,6 +525,90 @@ def _read_until_settled(seed):
     return g, total
 
 
+def _pixel_fast_read(expect=None, retries=2, allow_reset=False):
+    """像素整盘快读 + 一致性守卫。返回 grid；守不住就返回 None（交给 UIA）。
+
+    为什么快：UIA 每格一次跨进程调用（14.24ms/格），增量读 ~7 格就要 ~90ms；
+    像素通道一次抓整盘（BitBlt 8ms + 识别 ~30ms），而且**整盘都是新的**，
+    不会像增量读那样攒下漂移。
+
+    ⚠️ expect：这次动作**应该**已经打开的格子。扫雷展开有动画，像素读只要 ~33ms，
+    而 UIA 前沿补读要 ~131ms —— 那个「慢」一直在无意中充当动画等待时间。
+    少了它就会读到中间态，表现为「点开无效」（实测每局 9 次）。
+    所以这里按 expect 判断：一格都没变就等 50ms 重读（最多 retries 次）。
+    只在真需要时多读一次，不是无条件等。
+
+    守卫（挡住像素读错）：已经开出来的格子（数字/空白）和已插的旗，**不可能变回去**。
+    注意它挡不住「未开格被误读成数字」这一类（未开格本来就会变），所以整盘准确率是
+    前提：实测整局 108 次比对 / 23520 格，0 处不一致。
+    """
+    u = _READER['uia']
+    if u is None:
+        return None
+    _t0 = time.perf_counter()
+    try:
+        try:
+            g = read_board()
+            # ⚠️ 变化大 = 大连锁 = 动画久，而且**扫雷在连锁动画期间会忽略鼠标点击**
+            # （实测：开中心格后立刻插旗，11 面旗全部没插上 → 熔断停手）。
+            # UIA 前沿补读那 ~700ms 一直在无意中充当这个等待；像素读只要 33ms，
+            # 不补等就会冲到动画中间去。按变化量自适应：小动作（chord 开 2 格）不等。
+            changed = sum(1 for r in range(ROWS) for c in range(COLS)
+                          if u.state.get((r, c), '#') != g[r][c])
+            if changed > 8:
+                # 判据要「两次读间隔够久且完全一致」：连锁是逐格翻的，间隔太短会在
+                # 两格之间误判成稳定。实测 80ms 间隔不够（第 2 局 7 面旗全灭）。
+                for _ in range(20):
+                    time.sleep(0.15)
+                    g2 = read_board()
+                    if g2 == g:
+                        break
+                    g = g2
+            # expect：这次动作**应该**已经打开的格子。没变就等一下重读
+            # （动画没画完时读到的是中间态，表现为「点开无效」，实测每局 9 次）。
+            for _ in range(retries if expect else 0):
+                if any(g[r][c] != '#' for (r, c) in expect):
+                    break
+                time.sleep(0.05)
+                g = read_board()
+        except Exception:
+            return None
+        # 守卫：已开格/已插旗不可能变回去。但**整盘都是未开 = 新局**，
+        # 那不是读错，是棋盘被重置了 —— allow_reset 时放行
+        # （否则重开局会一直被拒、退回 UIA 全量读，白花 6.6 秒）。
+        fresh = all(g[r][c] == '#' for r in range(ROWS) for c in range(COLS))
+        if not (allow_reset and fresh):
+            for (r, c), v in u.state.items():
+                pv = g[r][c]
+                if pv == v:
+                    continue
+                if v == 'F':
+                    if pv != '#':          # 旗不见了 / 变成别的 → 可疑
+                        return None
+                elif v != '#' and pv == '#':   # 已开格被读成未开 → 可疑
+                    return None
+        # 通过：整盘替换状态（不是增量合并，所以不会漂移）
+        u.state.clear()
+        for r in range(ROWS):
+            for c in range(COLS):
+                if g[r][c] != '#':
+                    u.state[(r, c)] = g[r][c]
+        return g
+    finally:
+        _add('read(像素快读)', time.perf_counter() - _t0)
+
+
+def _pixel_board():
+    """纯像素整盘读（**不带守卫**）。新局刚开始时专用。
+
+    此时 UIA 元素引用已经失效，守卫拿旧状态去比会误判 —— 所以这里直接用。
+    """
+    try:
+        return read_board()
+    except Exception:
+        return None
+
+
 def read_grid(force_full: bool = False, focus=None, radius: int = 2,
               auto_expand: bool = False):
     """读当前棋盘。
@@ -522,6 +630,16 @@ def read_grid(force_full: bool = False, focus=None, radius: int = 2,
             return read_board()
         finally:
             _add('read(像素)', time.perf_counter() - _t0)
+    # 像素整盘快读：一次抓全盘（~33ms）比 UIA 增量读（~90ms）快，而且整盘都是新的、
+    # 不会漂移。**force_full 也走它** —— 原来 force_full 是 u.refresh(480 格) = 6.6 秒，
+    # 而它要的只是「当前盘面状态」，像素 33ms 就能给，而且守卫保证了状态完整性。
+    if PIXEL_FAST_READ:
+        _g = _pixel_fast_read(expect=[focus] if focus is not None else None,
+                              allow_reset=force_full)
+        if _g is not None:
+            _TODO['cells'] = [(r, c) for r in range(ROWS) for c in range(COLS)
+                              if _g[r][c] == '#']
+            return _g
     _t0 = time.perf_counter()
     try:
         if force_full:
@@ -679,10 +797,14 @@ def run_chord_batch(grid, rect, step, exclude=None, anchor=None, limit=None):
     # 执行 → 看不到 '.' → 判定没连锁 → **整片连锁被漏掉**（实测 60 次里漏 28 次）。
     # 原代码是 50ms + 131ms 读 = 181ms 才检查，这里对齐到同一量级。
     time.sleep(0.15)
-    if affected:
-        g, _n = _read_until_settled(affected)   # 有连锁就一圈圈补完，不留漂移
-    else:
-        g = u.grid()
+    # 优先用像素整盘快读（~33ms），比 UIA 前沿补读（~100~150ms）快好几倍，
+    # 而且整盘都是新的。守卫不通过就回退到 UIA 前沿补读。
+    g = _pixel_fast_read(expect=affected) if PIXEL_FAST_READ else None
+    if g is None:
+        if affected:
+            g, _n = _read_until_settled(affected)   # 有连锁就一圈圈补完，不留漂移
+        else:
+            g = u.grid()
     _TODO['cells'] = [(r, c) for r in range(ROWS) for c in range(COLS) if g[r][c] == '#']
     return clicked, last, g
 
@@ -938,9 +1060,23 @@ def run(dry: bool, allow_guess: bool, max_steps: int, remaining: int | None, loo
             # 这里只需确认棋盘确实重置，不要再去点菜单「新游戏」。
             time.sleep(1.0)
             _TODO['cells'] = None
-            n_now = sum(row.count('#') for row in read_grid(force_full=True))
+            # ⚠️ 这里**不能用 UIA 读盘**：新局开始后 UIA 元素引用会失效，
+            # 读出来还是上一局的终局（实测「未开 0 旗 99」而实际是全新 480 未开）。
+            # 像素读盘不依赖 UIA 元素，正好用来确认重置。
+            _pg = _pixel_board()
+            n_now = (sum(row.count('#') for row in _pg) if _pg is not None
+                     else sum(row.count('#') for row in read_grid(force_full=True)))
             if n_now == ROWS * COLS:
                 print(f'      已由弹窗「再玩一局(P)」开好新局（未开 {n_now}）')
+                # 新局 → **必须重新枚举**，否则后面每一次 UIA 读（尤其插旗校验）
+                # 拿到的都是上一局的旧数据，表现为「旗子插不上」→ 补标把旗取消
+                # → 熔断 stuck。实测连打第二局必挂就是这个原因。
+                _u = _READER['uia']
+                if _u is not None:
+                    _t0 = time.perf_counter()
+                    _u.enumerate_all()
+                    _TODO['cells'] = None
+                    print(f'      已重新枚举 UIA（{time.perf_counter()-_t0:.1f}s）')
                 continue
             print(f'      棋盘未重置（未开 {n_now}）→ 重试一次')
             new_hwnd = restart_game(hwnd)
