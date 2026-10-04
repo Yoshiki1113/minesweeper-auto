@@ -54,6 +54,22 @@ CHORD_BATCH = 6
 OPEN_DELAY = 0.32      # 点开后等界面刷新（扫雷有展开动画）
 FLAG_DELAY = 0.20
 
+# ── click() 内部的各段等待（秒）──
+# 这几段纯属「等游戏把鼠标消息处理完」，是 click 耗时的全部来源（实测 ~79ms/步、
+# 占每步 45%）。做成常量是为了能逐档做对照实验：改小更快，但太小会漏点/认不出 chord。
+#
+# 实测结论（每档 2 局、按「旗没插上 / chord失效」计数）：
+#   CLICK_* 三段**已经是实测最小值** —— 12/8/40 压到 8/5/28 后旗子漏点从 0 涨到 30，
+#   压到 4/3/14 涨到 49（漏点还会触发补标重试，总时间反而更长）。不要再动。
+#   CHORD_* 可以单独压（它只管双键同按，不影响右键插旗）：
+#   50/8 → 25/5 后 click 每步 77.5ms → 64ms，且 507 步 / 约 350 次 chord 零失效。
+#   再压到 18/4 只多省 4ms 却更贴临界，不值当。
+CLICK_SETTLE = 0.012     # SetCursorPos 之后，等窗口收到 WM_MOUSEMOVE
+CLICK_MOVE = 0.008       # 主动补一发 WM_MOUSEMOVE 之后
+CLICK_HOLD = 0.040       # 按下 → 抬起（太短会漏点）
+CHORD_GAP = 0.005        # 左键按下 → 右键按下
+CHORD_HOLD = 0.025       # 双键同时按住（太短游戏认不出 chord）
+
 
 def ensure_ready(hwnd: int) -> bool:
     """确保窗口可接收鼠标输入（UIA 的 Invoke 不依赖焦点，只有插旗/chord 需要）。
@@ -106,22 +122,22 @@ def click(x: int, y: int, right: bool = False, both: bool = False) -> None:
     _t0 = time.perf_counter()
     try:
         win32api.SetCursorPos((x, y))
-        time.sleep(0.012)
+        time.sleep(CLICK_SETTLE)
         win32api.mouse_event(win32con.MOUSEEVENTF_MOVE, 0, 0, 0, 0)   # 触发 WM_MOUSEMOVE
-        time.sleep(0.008)
+        time.sleep(CLICK_MOVE)
         if both:
             win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
-            time.sleep(0.008)
+            time.sleep(CHORD_GAP)
             win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTDOWN, 0, 0, 0, 0)
-            time.sleep(0.05)          # 两键同时按住的时间，太短游戏认不出 chord
+            time.sleep(CHORD_HOLD)    # 两键同时按住的时间，太短游戏认不出 chord
             win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
-            time.sleep(0.008)
+            time.sleep(CHORD_GAP)
             win32api.mouse_event(win32con.MOUSEEVENTF_RIGHTUP, 0, 0, 0, 0)
             return
         down, up = ((win32con.MOUSEEVENTF_RIGHTDOWN, win32con.MOUSEEVENTF_RIGHTUP) if right
                     else (win32con.MOUSEEVENTF_LEFTDOWN, win32con.MOUSEEVENTF_LEFTUP))
         win32api.mouse_event(down, 0, 0, 0, 0)
-        time.sleep(0.04)              # 按下到抬起，太短会漏点
+        time.sleep(CLICK_HOLD)        # 按下到抬起，太短会漏点
         win32api.mouse_event(up, 0, 0, 0, 0)
     finally:
         _add('click(动作+内等待)', time.perf_counter() - _t0)
@@ -404,6 +420,12 @@ def restart_game(hwnd: int) -> int:
 #
 # 速度：首次枚举 ~8.6s（每局一次）；之后热态全量重读 ~200ms（比像素识别还快）。
 _READER = {'uia': None}
+# 被替换下来的旧 UiaBoard。**不要删这个列表**：旧 board 的 _keepalive 里存着
+# **上一个 Minesweeper 进程**的 UIA 元素，一旦被 GC 去 Release 就会
+# access violation / 堆损坏（实测反复 hard_restart 后进程以
+# 0xC0000374 STATUS_HEAP_CORRUPTION 崩掉）。留着不释放，代价是每次重开
+# 多几百个指针（可忽略）。
+_OLD_BOARDS: list = []
 _TODO = {'cells': None}      # 待重读的格子（= 上次的未开格）
 _TIMING: dict = {}           # 各环节累计耗时（秒），用于找出真正的瓶颈
 
@@ -427,6 +449,10 @@ def report_timing(steps: int) -> None:
 def init_reader(hwnd: int, use_uia: bool = True):
     """初始化棋盘读取器。UIA 失败时自动回退像素识别。"""
     _TODO['cells'] = None
+    # 先把旧 board 收进 _OLD_BOARDS（别让它进 GC）——见 _OLD_BOARDS 的说明
+    old = _READER.get('uia')
+    if old is not None:
+        _OLD_BOARDS.append(old)
     if not use_uia:
         _READER['uia'] = None
         return None
