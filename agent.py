@@ -314,6 +314,13 @@ def _local_decide_inner(grid, anchor, skip_open, allow_guess, remaining,
     锚点会跟着新开的区域走，所以鼠标不会满屏幕乱飞。
     返回 (action, cell, reason)。
     """
+    # 0) 开局首点：全新棋盘（一格未开）没有任何数字可推理，而扫雷保证首点必定安全
+    #    （布雷是第一次点击之后才做的），所以直接点中心格。
+    #    ⚠️ 少了这一段，空盘会一路落到下面第 4 条「无确定步」直接停手 ——
+    #    表现就是「不加 --guess 连开局都开不了」，跟 README 的用法对不上。
+    if sum(row.count('#') for row in grid) == ROWS * COLS:
+        return 'open', (ROWS // 2, COLS // 2), '开局首点（必定安全）'
+
     cons = collect_constraints(grid, ROWS, COLS)
     mines, safes = certain_moves(cons)
 
@@ -345,48 +352,6 @@ def _local_decide_inner(grid, anchor, skip_open, allow_guess, remaining,
     if not allow_guess:
         return None, None, '无确定步（且未允许猜）'
     probs, _ = probabilities(grid, ROWS, COLS, remaining)
-    cands = [c for c in probs if grid[c[0]][c[1]] == '#']
-    if not cands:
-        return None, None, '没有可推断的格子'
-    cell = min(cands, key=lambda c: probs[c])
-    return 'open', cell, f'无确定步，赌概率最低 {probs[cell]:.3f}'
-
-
-def decide_once(grid, allow_guess: bool, remaining: int | None,
-                no_chord=None, disable_chord: bool = False, skip_open=None,
-                anchor=None):
-    """按「标雷 → 双击 → 开安全格 → 猜」的顺序决策。
-
-    no_chord:     双击失败过的数字格集合
-    disable_chord: 本次不再尝试双击（双击连败时会临时关掉，改用逐个点开）
-    返回 (action, cell, reason)，action ∈ {'flag','chord','open',None}。
-    注意 action='chord' 时 cell 是**已开的数字格**（双击它），不是未开格。
-    """
-    n_unopened = sum(row.count('#') for row in grid)
-    if n_unopened == ROWS * COLS:
-        return 'open', (ROWS // 2, COLS // 2), '开局首点（必定安全）'
-
-    cons = collect_constraints(grid, ROWS, COLS)
-    mines, safes = certain_moves(cons)
-
-    # 1) 先把确定的雷标出来（chord 依赖它）
-    if mines:
-        return 'flag', sorted(mines)[0], f'确定是雷，本步可标 {len(mines)} 个'
-    # 2) 雷标全了就双击，一次开一片
-    if not disable_chord:
-        ch = find_chordable(grid, exclude=no_chord, anchor=anchor)
-        if ch:
-            cell, k = ch
-            return 'chord', cell, f'双键开安全区 (r{cell[0]},c{cell[1]}) 可开 {k} 格'
-    # 3) 确定安全格
-    if safes:
-        cand = [c for c in sorted(safes) if c not in (skip_open or set())]
-        if cand:
-            return 'open', cand[0], f'确定安全格，本步可开 {len(cand)} 个'
-    # 4) 没确定步了
-    if not allow_guess:
-        return None, None, '无确定步（没有可标雷/可双击/可推安全格）'
-    probs, diag = probabilities(grid, ROWS, COLS, remaining)
     cands = [c for c in probs if grid[c[0]][c[1]] == '#']
     if not cands:
         return None, None, '没有可推断的格子'
@@ -794,8 +759,15 @@ def play_game(hwnd, dry, allow_guess, max_steps, remaining, game_no=1):
         else:
             grid = read_grid(focus=cell, radius=1, auto_expand=True)
         after = sum(row.count('#') for row in grid)
-        # 每次动作后也看下弹窗（失败是唯一需要立刻换局的信号；新游戏框则继续）
+        # 每次动作后也看下弹窗。
+        # ⚠️ 胜负都必须在这里判：**胜利框往往正是动作之后弹出来的**（比如最后一步 chord）。
+        # 只判负、把 gamewin 当普通模态框处理的话，会按 P 开一局新游戏、再拿着旧盘面
+        # 继续打（表现为连串「点开无效」→ 判 stuck）—— 实测就这样白白漏掉过一次胜利。
         post = handle_modal(prefer_continue=True)
+        if post.startswith('gamewin'):
+            print(f'🎉 检测到「游戏胜利」弹窗（{post}）→ 本局胜利')
+            log_step(step, {'action': 'gamewin-dialog', 'after': after})
+            return 'win', done
         if post.startswith('gameover'):
             print(f'★ 检测到「游戏失败」弹窗（{post}）')
             log_step(step, {'action': 'gameover-dialog', 'after': after})

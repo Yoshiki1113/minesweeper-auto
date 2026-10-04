@@ -39,11 +39,13 @@ def data(*parts: str) -> str:
 
 def minesweeper_exe() -> str:
     """扫雷程序位置：优先用随包携带的那份（迁移到别的电脑也能跑），
-    找不到才回退到本机已安装的路径。"""
+    找不到才回退到当前用户的「文档\\扫雷\\」。"""
     bundled = resource('Minesweeper.exe')
     if os.path.exists(bundled):
         return bundled
-    fallback = r'C:\Users\spp\Documents\扫雷\Minesweeper.exe'
+    # 回退路径按**当前用户**推导。原来这里写死 C:\Users\spp\...，
+    # 那是别的机器上留下的用户名，本机（C:\Users\sp）根本不存在 → 永远找不到。
+    fallback = os.path.join(os.path.expanduser('~'), 'Documents', '扫雷', 'Minesweeper.exe')
     return fallback if os.path.exists(fallback) else bundled
 
 

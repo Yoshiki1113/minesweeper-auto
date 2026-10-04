@@ -98,6 +98,12 @@ class UiaBoard:
         self.verbose = verbose
         self.elements: Dict[Cell, object] = {}
         self.state: Dict[Cell, str] = {}
+        # ⚠️ 临时 COM 对象的「墓地」。**不要删这个列表**：实测把这些临时对象
+        # （枚举时的 root/cache/cond/found、invoke 时的 pattern 指针）留给垃圾回收，
+        # comtypes 会在下一次 GC 的 __del__ → Release 里 access violation，
+        # 整个进程直接挂掉（4/4 稳定复现，栈顶是 Garbage-collecting）。
+        # 每局只枚举一次，留着的内存代价可忽略。
+        self._keepalive: list = []
         self.hwnd = hwnd or win32gui.FindWindow(None, WINDOW_TITLE)
         if not self.hwnd:
             raise RuntimeError(f'找不到窗口 {WINDOW_TITLE!r}')
@@ -122,6 +128,10 @@ class UiaBoard:
         cond = self.uia.CreatePropertyCondition(
             UIA.UIA_ControlTypePropertyId, UIA.UIA_ButtonControlTypeId)
         found = root.FindAllBuildCache(UIA.TreeScope_Descendants, cond, cache)
+        # 留着强引用，别让 GC 去 Release 它们（见 __init__ 里 _keepalive 的说明）
+        self._keepalive.extend((root, cache, cond, found))
+        # 旧的元素引用同理：直接丢掉会让 GC 在随机时刻 Release 它们
+        self._keepalive.extend(self.elements.values())
         self.elements.clear()
         self.state.clear()
         for i in range(found.Length):
@@ -218,10 +228,12 @@ class UiaBoard:
         try:
             if pattern == 'invoke':
                 p = e.GetCurrentPattern(UIA.UIA_InvokePatternId)
+                self._keepalive.append(p)      # 别留给 GC，否则 __del__→Release 会崩
                 cast(p, POINTER(UIA.IUIAutomationInvokePattern)).Invoke()
                 return True
             if pattern == 'legacy':
                 p = e.GetCurrentPattern(UIA.UIA_LegacyIAccessiblePatternId)
+                self._keepalive.append(p)
                 cast(p, POINTER(UIA.IUIAutomationLegacyIAccessiblePattern)).DoDefaultAction()
                 return True
         except Exception:
