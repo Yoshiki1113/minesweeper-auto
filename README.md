@@ -43,6 +43,7 @@ python 扫雷控制台.bat           # 双击这个开 GUI 控制台
 python record.py                # 录到运行 停录.bat 或按 Ctrl+C
 python record.py --seconds 30   # 只录 30 秒
 python record.py --fps 30       # 改帧率
+python record.py --hw           # 硬件编码（自动试 qsv/nvenc/amf）
 ```
 
 或双击 `录屏.bat` / `停录.bat`。产出在 `record/`。
@@ -56,6 +57,14 @@ python record.py --fps 30       # 改帧率
 
 所以别直接 kill ffmpeg；`停录.bat` 只是建一个 `record\STOP` 标志，由 `record.py`
 转成 `q` 送进去。另：抓取按窗口标题（`title=扫雷`），跟着窗口走，也不受 DPI 缩放影响。
+
+**开销**：录制时 AI 从 ~100 ms/步 掉到 ~154 ms/步（每步慢 57%）。编码器只占其中
+0.87 个核（`--hw` 用 qsv 降到 0.64 个核），大头是 gdigrab 每帧一次全窗口 BitBlt
++ RGB→YUV，和 AI 自己的截图/UIA 读盘抢资源。要跑得快就别同时录。
+
+**编码器选择**：默认 `libx264 -preset ultrafast -crf 18`。硬件编码省约 0.2 个核，
+但同样 3 秒画面 libx264 出 0.85 MB、qsv 只出 0.23 MB —— 屏幕内容（数字笔画）
+对压缩更敏感，追求清晰就别用 `--hw`。
 
 ## 说明
 

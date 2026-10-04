@@ -49,6 +49,36 @@ def find_ffmpeg():
     return None
 
 
+# 硬件编码器：**编译进去不等于能用**。实测本机 nvenc 缺 nvcuda.dll、
+# amf 缺 amfrt64.dll，只有 qsv 能跑（Intel Arc）。所以必须真跑一次才算数。
+HW_ENCODERS = [
+    ('h264_qsv', ['-c:v', 'h264_qsv', '-global_quality', '22']),
+    ('h264_nvenc', ['-c:v', 'h264_nvenc', '-cq', '23']),
+    ('h264_amf', ['-c:v', 'h264_amf', '-quality', 'speed']),
+]
+SW_ENCODER = ['-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18']
+
+
+def detect_hw(ff):
+    """试出一个真能用的硬件编码器，返回 (名字, 参数)；都不行就返回 (None, 软编参数)。
+
+    省得不多（实测 libx264 ultrafast 0.87 核 vs qsv 0.64 核）—— 因为瓶颈在
+    gdigrab 抓取本身（每帧一次全窗口 BitBlt + RGB→YUV），不在编码器。
+    """
+    for name, args in HW_ENCODERS:
+        try:
+            r = subprocess.run(
+                [ff, '-hide_banner', '-loglevel', 'error',
+                 '-f', 'lavfi', '-i', 'color=c=black:s=256x256:d=0.2', '-r', '30']
+                + args + ['-f', 'null', '-'],
+                capture_output=True, timeout=30)
+            if r.returncode == 0:
+                return name, args
+        except Exception:
+            continue
+    return None, SW_ENCODER
+
+
 def window_exists(title=TITLE):
     """扫雷在不在跑。用 win32gui（找不到就退化成「假定在」，让 ffmpeg 自己报错）。"""
     try:
@@ -58,7 +88,7 @@ def window_exists(title=TITLE):
         return True
 
 
-def build_cmd(ff, out, seconds=None):
+def build_cmd(ff, out, seconds=None, encoder=None):
     # -framerate 60     目标 60 帧
     # title=扫雷         按窗口标题抓：跟着窗口走，且不受 DPI 缩放影响
     # scale=trunc(...)   宽高取偶数，否则 yuv420p 编不了（实测抓到 1307，是奇数）
@@ -66,9 +96,9 @@ def build_cmd(ff, out, seconds=None):
     # +faststart         把 moov 挪到文件头（收尾时做，所以要能优雅停止）
     cmd = [ff, '-hide_banner', '-loglevel', 'warning', '-stats',
            '-f', 'gdigrab', '-framerate', str(FPS), '-i', f'title={TITLE}',
-           '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-pix_fmt', 'yuv420p',
-           '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-g', '120',
-           '-movflags', '+faststart']
+           '-vf', 'scale=trunc(iw/2)*2:trunc(ih/2)*2', '-pix_fmt', 'yuv420p']
+    cmd += encoder or SW_ENCODER
+    cmd += ['-g', '120', '-movflags', '+faststart']
     if seconds:
         cmd += ['-t', str(seconds)]
     cmd += ['-y', out]
@@ -84,6 +114,9 @@ def main():
     ap.add_argument('--title', default=TITLE, help=f'窗口标题（默认 {TITLE}）')
     ap.add_argument('--fps', type=int, default=FPS, help=f'帧率（默认 {FPS}）')
     ap.add_argument('--crf', type=int, default=18, help='质量，越小越好（默认 18）')
+    ap.add_argument('--hw', action='store_true',
+                    help='用硬件编码（自动试 qsv/nvenc/amf，省约 0.2 个核；'
+                         '默认用 libx264，体积和质量更好）')
     args = ap.parse_args()
 
     os.makedirs(OUTDIR, exist_ok=True)
@@ -122,14 +155,20 @@ def main():
             pass
 
     out = os.path.join(OUTDIR, f'{args.title}-{datetime.now():%Y%m%d-%H%M%S}.mp4')
-    cmd = build_cmd(ff, out, args.seconds)
+    encoder, enc_name = SW_ENCODER, 'libx264'
+    if args.hw:
+        enc_name, encoder = detect_hw(ff)
+        if enc_name is None:
+            print('  [!] 没找到能用的硬件编码器，退回 libx264')
+            enc_name = 'libx264'
+    cmd = build_cmd(ff, out, args.seconds, encoder)
     if args.fps != FPS:
         cmd[cmd.index(str(FPS))] = str(args.fps)
-    if args.crf != 18:
+    if not args.hw and args.crf != 18:
         cmd[cmd.index('-crf') + 1] = str(args.crf)
 
     print(f'  ffmpeg : {ff}')
-    print(f'  窗口   : {args.title}   {args.fps} fps')
+    print(f'  窗口   : {args.title}   {args.fps} fps   编码 {enc_name}')
     print(f'  输出   : {out}')
     print('  停止   : 运行 停录.bat，或在本窗口按 Ctrl+C')
     print()
