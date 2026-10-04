@@ -21,8 +21,7 @@
 """
 from __future__ import annotations
 
-import itertools
-from typing import Dict, Iterable, List, Sequence, Set, Tuple
+from typing import Dict, List, Sequence, Set, Tuple
 
 Cell = Tuple[int, int]
 Grid = Sequence[str]
@@ -307,7 +306,7 @@ def decide(grid: Grid, rows: int, cols: int, remaining_mines: int | None = None)
 
 
 if __name__ == '__main__':
-    from identify import grab_window, read_board, show, ROWS, COLS
+    from identify import ROWS, COLS, read_board, show
 
     grid = read_board()
     show(grid)

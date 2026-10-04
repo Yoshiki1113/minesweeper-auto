@@ -23,7 +23,7 @@ except Exception:
 
 import win32con
 import win32gui
-from PIL import Image, ImageDraw, ImageGrab
+from PIL import ImageGrab
 
 WINDOW_TITLE = '扫雷'
 

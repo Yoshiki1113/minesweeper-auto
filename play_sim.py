@@ -132,7 +132,6 @@ def run(rows, cols, n_mines, trials, seed=7, mode='solver', label=''):
         r = play(rows, cols, n_mines, rng, mode=mode)
         stats[r['result']] = stats.get(r['result'], 0) + 1
         gsum += r['guesses']
-    dt = time.time() - t0
     win = stats.get('win', 0)
     print(f"\n=== {label or mode}  {rows}x{cols} / {n_mines} 雷 / {trials} 局 ({(time.time()-t0):.1f}s) ===")
     print(f"  胜率      {win/trials:6.2%}   ({win}/{trials})")

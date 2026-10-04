@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import random
 import sys
-from typing import Dict, List, Set, Tuple
+from typing import List, Set, Tuple
 
 from solver import (collect_constraints, certain_moves, probabilities,
                     neighbors)

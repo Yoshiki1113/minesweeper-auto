@@ -34,7 +34,7 @@ import paths
 
 # 开发时脚本同目录可能有 _MEIPASS 解不开的模块；打包后 _MEIPASS 自己就在 sys.path 里。
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from identify import COLS, ROWS, cell_center, grab_window, read_board, show
+from identify import COLS, ROWS, cell_center, read_board
 from solver import collect_constraints, certain_moves, probabilities
 
 WINDOW_TITLE = '扫雷'
@@ -46,6 +46,11 @@ STOP_ZONE = 6          # 左上角 6x6 像素 = 急停区
 STOP_KEYS = ((0x5B, 'Win 键'), (0x5C, '右 Win 键'))
 # 同一个格子连续插旗失败这么多次就停手。坐标错位/窗口被遮挡时，没有熔断会无限重试。
 FLAG_FAIL_LIMIT = 3
+# 一步最多连点几个 chord。同盘面算出的 chord 互相独立（前置条件只看旗子，
+# 而 chord 只开格、不改旗子），所以可以连着点完、只读一次盘。
+# 实测同一盘面中位有 10 个格子可 chord —— 取 6 是「省下的读盘」与
+# 「一次读的格数变多」之间的折中。
+CHORD_BATCH = 6
 OPEN_DELAY = 0.32      # 点开后等界面刷新（扫雷有展开动画）
 FLAG_DELAY = 0.20
 
@@ -135,7 +140,7 @@ _ENTER = {'gameover': ord('P'),     # 再玩一局（直接开新局，实测可
           'gamewin': ord('P')}      # 再玩一局
 
 
-def find_modal() -> Tuple[int, str]:
+def find_modal() -> tuple[int, str]:
     """找阻塞主窗口的模态对话框。返回 (hwnd, kind)，没有则 (0, '')。"""
     for title, kind in MODAL_TITLES:
         h = win32gui.FindWindow(None, title)
@@ -171,20 +176,6 @@ def handle_modal(prefer_continue: bool = True) -> str:
     return f'{kind}→{chr(key)}'
 
 
-def game_over_dialog() -> int:
-    """只看「游戏失败」弹窗（失败的唯一可靠信号），返回句柄，0 = 没有。"""
-    h = win32gui.FindWindow(None, '游戏失败')
-    return h if (h and win32gui.IsWindowVisible(h)) else 0
-
-
-def dismiss_game_over() -> bool:
-    """关掉失败弹窗并重开：按 R（重新开始这个游戏）。"""
-    if not game_over_dialog():
-        return False
-    print('      ' + handle_modal())
-    return True
-
-
 def stop_reason():
     """急停检测。命中返回原因字符串，未命中返回 None。
 
@@ -205,64 +196,12 @@ def stop_reason():
     return None
 
 
-def stopped() -> bool:
-    return stop_reason() is not None
-
-
 def log_step(step: int, payload: dict) -> None:
     os.makedirs(LOG_DIR, exist_ok=True)
     day = time.strftime('%Y%m%d')
     with open(os.path.join(LOG_DIR, f'step-{day}.jsonl'), 'a', encoding='utf-8') as f:
         f.write(json.dumps({'t': time.strftime('%H:%M:%S'), 'step': step, **payload},
                            ensure_ascii=False) + '\n')
-
-
-def wait_stable(timeout: float = 4.0, interval: float = 0.22):
-    """等棋盘稳定：连续两次识别结果完全一致才返回。
-
-    扫雷展开有动画，动画没画完就截图会把“正在展开”读成“没生效”，
-    进而误判点击失败、甚至误判游戏结束。
-    """
-    prev = None
-    t0 = time.time()
-    while time.time() - t0 < timeout:
-        g = read_board()
-        sig = ''.join(''.join(row) for row in g)
-        if sig == prev:
-            return g
-        prev = sig
-        time.sleep(interval)
-    return read_board()
-
-
-def find_chordable(grid, exclude=None, anchor=None):
-    """找一个能 chord（左键+右键同时按）的已开数字格：周围雷已标全且还有未开格。
-
-    在数字格上双键 → 把它周围剩下的未开格一次全开。
-    anchor: 上次操作的位置。优先选靠近锚点的（鼠标少跑路，形成贪吃蛇式连续推进）；
-            同等条件下选能一次开最多格的。
-    返回 (cell, n_to_open) 或 None。
-    """
-    from solver import neighbors
-    exclude = exclude or set()
-    best = None
-    for r in range(ROWS):
-        for c in range(COLS):
-            if (r, c) in exclude:
-                continue
-            v = grid[r][c]
-            if not v.isdigit() or int(v) == 0:
-                continue
-            nbr = neighbors(r, c, ROWS, COLS)
-            flags = sum(1 for p in nbr if grid[p[0]][p[1]] == 'F')
-            unk = [p for p in nbr if grid[p[0]][p[1]] == '#']
-            if flags == int(v) and unk:
-                score = len(unk) * 10
-                if anchor is not None:
-                    score -= abs(r - anchor[0]) + abs(c - anchor[1])
-                if best is None or score > best[2]:
-                    best = ((r, c), len(unk), score)
-    return (best[0], best[1]) if best else None
 
 
 def find_chordable_by_digit(grid, exclude=None, anchor=None):
@@ -292,6 +231,45 @@ def find_chordable_by_digit(grid, exclude=None, anchor=None):
                 if best is None or key < best[0]:
                     best = (key, (r, c), len(unk))
     return (best[1], best[2]) if best else None
+
+
+def find_chordable_batch(grid, limit, exclude=None, anchor=None):
+    """找出最多 limit 个可 chord 的格子（按同样的「数字小 > 离锚点近 > 开得多」排序）。
+
+    返回 [((r,c), [未开邻格...]), ...]。未开邻格一起带出来，是为了后面
+    「只读这些格子」——它们就是这次 chord 唯一可能改变的格子。
+
+    为什么能一次点多个：chord 的前置条件只有「周围旗数 == 数字」，而 chord
+    只开格、不改旗子，所以同一盘面算出的多个 chord 互不影响。
+    """
+    from solver import neighbors
+    exclude = exclude or set()
+    cands = []
+    for r in range(ROWS):
+        for c in range(COLS):
+            if (r, c) in exclude:
+                continue
+            v = grid[r][c]
+            if not v.isdigit() or int(v) == 0:
+                continue
+            nbr = neighbors(r, c, ROWS, COLS)
+            flags = sum(1 for p in nbr if grid[p[0]][p[1]] == 'F')
+            unk = [p for p in nbr if grid[p[0]][p[1]] == '#']
+            if flags == int(v) and unk:
+                d = abs(r - anchor[0]) + abs(c - anchor[1]) if anchor else 0
+                cands.append(((int(v), d, -len(unk)), (r, c), unk))
+    cands.sort(key=lambda t: t[0])
+
+    picked = []
+    for _key, cell, unk in cands:
+        # 跳过紧挨着已选格子的候选：前一个 chord 多半已经把它的邻格开了，
+        # 再点一次基本是空动作（白花一次 ~86ms 的点击）。
+        if any(max(abs(cell[0] - p[0]), abs(cell[1] - p[1])) <= 1 for p, _ in picked):
+            continue
+        picked.append((cell, unk))
+        if len(picked) >= limit:
+            break
+    return picked
 
 
 def local_decide(grid, anchor=None, skip_open=None, allow_guess=False,
@@ -462,6 +440,41 @@ def init_reader(hwnd: int, use_uia: bool = True):
     return _READER['uia']
 
 
+def _read_until_settled(seed):
+    """读 seed 这些格子；一旦出现**新**露出的空白格，就一圈圈往外补读，
+    直到不再有新空白格。返回 (grid, 实际读了多少格)。
+
+    为什么必须一圈圈，而不是固定补一圈：开中心格一次能连锁开出 90+ 格，
+    固定读 5x5（25 格）会漏掉 60+ 格 —— 那些格子在本地盘面上仍是 '#'，
+    求解器于是把已开格当成未开格（实测每局约 18% 的步会留下这种漂移）。
+    只读「真正变了的格子」，所以既完整又不浪费。
+    """
+    u = _READER['uia']
+    seen = set(seed)
+    frontier = list(seed)
+    total = 0
+    rounds = 0
+    g = u.grid()
+    while frontier and rounds < 16:          # 兜底上限，防意外死循环
+        before = {p: u.state.get(p, '#') for p in frontier}
+        u.refresh(frontier)
+        total += len(frontier)
+        g = u.grid()
+        nxt = []
+        for (r, c) in frontier:
+            if g[r][c] == '.' and before.get((r, c), '#') != '.':
+                for dr in (-1, 0, 1):
+                    for dc in (-1, 0, 1):
+                        rr, cc = r + dr, c + dc
+                        if (0 <= rr < ROWS and 0 <= cc < COLS
+                                and (rr, cc) not in seen):
+                            seen.add((rr, cc))
+                            nxt.append((rr, cc))
+        frontier = nxt
+        rounds += 1
+    return g, total
+
+
 def read_grid(force_full: bool = False, focus=None, radius: int = 2,
               auto_expand: bool = False):
     """读当前棋盘。
@@ -473,8 +486,8 @@ def read_grid(force_full: bool = False, focus=None, radius: int = 2,
     依据：已开格的状态永远不会变（开了就是开了，数字也不再变），不必重读。
 
     auto_expand：配合 radius=1 用。扫雷里**只有空白格 '.' 会连锁展开**
-    （数字格展开不会超出自己那一圈），所以先读 3x3，一旦看到 '.' 就补读
-    外面一圈（5x5）——既快又不会漏掉一大片连锁展开。
+    （数字格展开不会超出自己那一圈），所以先读 3x3，一旦出现**新露出的**空白格
+    就按前沿一圈圈往外补读，直到不再有新空白格 —— 既完整又不会多读。
     """
     u = _READER['uia']
     if u is None:
@@ -499,14 +512,11 @@ def read_grid(force_full: bool = False, focus=None, radius: int = 2,
 
             inner = _ring(radius)
             if inner:
-                u.refresh(inner)
-            if auto_expand and radius < 2:
-                g1 = u.grid()
-                if any(g1[r][c] == '.' for r, c in inner):
-                    seen = set(inner)
-                    extra = [c for c in _ring(2) if c not in seen]
-                    if extra:
-                        u.refresh(extra)
+                if auto_expand:
+                    # 按连锁前沿一圈圈补读，直到不再有新空白格（见 _read_until_settled）
+                    _read_until_settled(inner)
+                else:
+                    u.refresh(inner)
         else:
             todo = _TODO['cells'] or list(u.elements)
             try:
@@ -573,18 +583,82 @@ def open_cell(r: int, c: int, rect) -> str:
     return 'mouse'
 
 
-def flag_cell(r: int, c: int, rect) -> bool:
-    """插旗（UIA 没右键通道，只能鼠标），插完用 UIA 验证一下。"""
-    x, y = click_point_for(r, c, rect)
-    click(x, y, right=True)
+def check_result_modal(step: int, after: int):
+    """动作之后检查胜负弹窗，返回 'win' / 'lost' / None。
+
+    ⚠️ 胜负都必须在这里判：**胜利框往往正是动作之后弹出来的**（比如最后一步 chord）。
+    只判负、把 gamewin 当普通模态框处理的话，会按 P 开一局新游戏、再拿着旧盘面
+    继续打（表现为连串「点开无效」→ 判 stuck）—— 实测就这样白白漏掉过一次胜利。
+    """
+    post = handle_modal(prefer_continue=True)
+    if post.startswith('gamewin'):
+        print(f'🎉 检测到「游戏胜利」弹窗（{post}）→ 本局胜利')
+        log_step(step, {'action': 'gamewin-dialog', 'after': after})
+        return 'win'
+    if post.startswith('gameover'):
+        print(f'★ 检测到「游戏失败」弹窗（{post}）')
+        log_step(step, {'action': 'gameover-dialog', 'after': after})
+        return 'lost'
+    if post:
+        print(f'[{step}] 处理模态框：{post}')
+    return None
+
+
+def run_chord_batch(grid, rect, step, exclude=None, anchor=None, limit=None):
+    """一次执行多个 chord，**只读一次盘**。返回 (执行数, 最后一个格子, 新 grid)。
+
+    提速原理：旧逻辑每个 chord 都是一整步 —— 点一次 + 读一次盘（131~337ms）。
+    而读盘占了每步的 59%（实测 read 166ms / click 85ms / wait 29ms），
+    所以「少读几次」是唯一的杠杆。同一盘面算出的 chord 互相独立，可以连着点完。
+
+    读盘范围也一起收窄了：chord 只会开「它自己的未开邻格」（不会开到 3x3 之外），
+    所以只读这些格子（平均每 chord 1.77 格），而不是每步读一个 3x3/5x5。
+    """
     u = _READER['uia']
-    if u is not None:
-        try:
-            u.refresh([(r, c)])          # refresh 会写回盘面，read 只是查询
-        except Exception:
-            pass
-        return u.grid()[r][c] == 'F'
-    return True
+    if u is None:
+        return 0, None, grid
+    batch = find_chordable_batch(grid, limit or CHORD_BATCH,
+                                 exclude=exclude, anchor=anchor)
+    if not batch:
+        return 0, None, grid
+    if len(batch) > 1:
+        print(f'      → 批量 chord {len(batch)} 个：{[b[0] for b in batch]}')
+    log_step(step, {'action': 'chord-batch', 'n': len(batch),
+                    'cells': [list(b[0]) for b in batch]})
+
+    affected, seen = [], set()
+    for _cell, unk in batch:
+        for p in unk:
+            if p not in seen:
+                seen.add(p)
+                affected.append(p)
+
+    clicked, last = 0, None
+    for (r, c) in [b[0] for b in batch]:
+        why = stop_reason()
+        if why:
+            print(f'★ 检测到急停（{why}），退出')
+            break
+        x, y = click_point_for(r, c, rect)
+        if not (rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]):
+            continue
+        click(x, y, both=True)
+        clicked += 1
+        last = (r, c)
+    if not clicked:
+        return 0, None, grid
+
+    # ⚠️ 这个等待不能省：定向读盘只要 ~30ms，比原来的 3x3（131ms）快得多，
+    # 若不在点完之后补足时间，「有没有新空白格」的检查会在展开动画还没画完时
+    # 执行 → 看不到 '.' → 判定没连锁 → **整片连锁被漏掉**（实测 60 次里漏 28 次）。
+    # 原代码是 50ms + 131ms 读 = 181ms 才检查，这里对齐到同一量级。
+    time.sleep(0.15)
+    if affected:
+        g, _n = _read_until_settled(affected)   # 有连锁就一圈圈补完，不留漂移
+    else:
+        g = u.grid()
+    _TODO['cells'] = [(r, c) for r in range(ROWS) for c in range(COLS) if g[r][c] == '#']
+    return clicked, last, g
 
 
 def play_game(hwnd, dry, allow_guess, max_steps, remaining, game_no=1):
@@ -634,7 +708,7 @@ def play_game(hwnd, dry, allow_guess, max_steps, remaining, game_no=1):
         rect = win32gui.GetWindowRect(hwnd)
         n_unopened = sum(row.count('#') for row in grid)
         if n_unopened == 0:
-            print(f'🎉 通关！剩余未开格 0')
+            print('🎉 通关！剩余未开格 0')
             return 'win', done
 
         # 提速关键：标雷不改变棋盘布局，所以一次识别就可以把该标的雷连着标完，
@@ -742,6 +816,26 @@ def play_game(hwnd, dry, allow_guess, max_steps, remaining, game_no=1):
                         'unopened': n_unopened, 'reason': reason})
         if dry:
             return 'stuck', 0
+        if action == 'chord':
+            # ── 批量 chord：一次点完多个、只读一次盘（详见 run_chord_batch）──
+            n_ch, last, grid = run_chord_batch(grid, rect, step,
+                                               exclude=failed_chord, anchor=anchor)
+            if n_ch:
+                done += n_ch
+                after = sum(row.count('#') for row in grid)
+                res = check_result_modal(step, after)
+                if res:
+                    return res, done
+                if after == n_unopened:
+                    failed_chord.add(cell)
+                    chord_fail += 1
+                    print(f'      ⚠ 批量 chord 没生效（连败 {chord_fail}）')
+                    if chord_fail >= 2:
+                        disable_chord = True
+                else:
+                    chord_fail = 0
+                    anchor = last          # 锚点前移：下一步优先在附近继续开
+                continue
         if action == 'open':
             open_cell(rr, cc, rect)          # UIA 走 Invoke（不碰鼠标、不依赖焦点）
         else:
@@ -763,17 +857,9 @@ def play_game(hwnd, dry, allow_guess, max_steps, remaining, game_no=1):
         # ⚠️ 胜负都必须在这里判：**胜利框往往正是动作之后弹出来的**（比如最后一步 chord）。
         # 只判负、把 gamewin 当普通模态框处理的话，会按 P 开一局新游戏、再拿着旧盘面
         # 继续打（表现为连串「点开无效」→ 判 stuck）—— 实测就这样白白漏掉过一次胜利。
-        post = handle_modal(prefer_continue=True)
-        if post.startswith('gamewin'):
-            print(f'🎉 检测到「游戏胜利」弹窗（{post}）→ 本局胜利')
-            log_step(step, {'action': 'gamewin-dialog', 'after': after})
-            return 'win', done
-        if post.startswith('gameover'):
-            print(f'★ 检测到「游戏失败」弹窗（{post}）')
-            log_step(step, {'action': 'gameover-dialog', 'after': after})
-            return 'lost', done
-        if post:
-            print(f'[{step}] 处理模态框：{post}')
+        res = check_result_modal(step, after)
+        if res:
+            return res, done
         if after == n_unopened and action == 'chord':
             # 左右键同时按未被识别 —— 这不是游戏结束，降级为逐个点开
             failed_chord.add(cell)
