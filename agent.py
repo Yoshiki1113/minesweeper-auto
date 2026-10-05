@@ -84,6 +84,14 @@ CHORD_GAP = 0.005        # 左键按下 → 右键按下
 CHORD_HOLD = 0.025       # 双键同时按住（太短游戏认不出 chord）
 
 
+# 窗口能不能抢到前台。插旗和 chord 都走**真实鼠标**，抢不到前台时右键会打到别的
+# 窗口上，旗子一面都插不上 → 连续 3 轮触发熔断 → 整局作废。
+# 实测这台机器上 Excel / QQ / Everything / 终端 / Edge / DSH 自己都在抢焦点，
+# 丢焦点是常态（100 局里因此废掉 5 局），所以必须有降级路径：
+# 抢不到就只走 UIA invoke 开格（不依赖焦点），而不是硬插旗。
+_MOUSE_OK = True
+
+
 def ensure_ready(hwnd: int) -> bool:
     """确保窗口可接收鼠标输入（UIA 的 Invoke 不依赖焦点，只有插旗/chord 需要）。
 
@@ -93,10 +101,13 @@ def ensure_ready(hwnd: int) -> bool:
     实测后台投递（PostMessage WM_RBUTTONDOWN/UP）经典扫雷不认，所以只能走真实鼠标，
     也就必须真的把它置前。
     """
+    global _MOUSE_OK
+    _MOUSE_OK = False
     if win32gui.IsIconic(hwnd):
         win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
         time.sleep(0.35)
     if win32gui.GetForegroundWindow() == hwnd:
+        _MOUSE_OK = True
         return True
     # 第一次：常规尝试
     try:
@@ -105,6 +116,7 @@ def ensure_ready(hwnd: int) -> bool:
     except Exception:
         pass
     if win32gui.GetForegroundWindow() == hwnd:
+        _MOUSE_OK = True
         return True
     # 第二次：借用当前前台线程的输入队列，绕过前台锁定
     try:
@@ -123,7 +135,23 @@ def ensure_ready(hwnd: int) -> bool:
         time.sleep(0.08)
     except Exception:
         pass
-    return win32gui.GetForegroundWindow() == hwnd
+    _MOUSE_OK = win32gui.GetForegroundWindow() == hwnd
+    return _MOUSE_OK
+
+
+def _mouse_ok(hwnd: int, step: int = 0) -> bool:
+    """能不能用鼠标（插旗 / chord 的前提）。抢不到前台就返回 False。
+
+    抢不到时**必须放弃鼠标动作**：硬插的话右键会打到别的窗口上，一面旗都插不上，
+    连续 3 轮触发熔断、整局作废（实测 100 局里这样废掉 5 局）。
+    返回 False 后调用方会退回「只用 UIA invoke 开格」——开格不依赖焦点，这一局能继续。
+    """
+    for _ in range(3):
+        if ensure_ready(hwnd):
+            return True
+        time.sleep(0.2)
+    print(f'[{step}] ⚠ 扫雷窗口抢不到前台 → 本轮只用 UIA 开格（不插旗/chord）')
+    return False
 
 
 def click(x: int, y: int, right: bool = False, both: bool = False) -> None:
@@ -302,17 +330,18 @@ def find_chordable_batch(grid, limit, exclude=None, anchor=None):
 
 
 def local_decide(grid, anchor=None, skip_open=None, allow_guess=False,
-                 remaining=None, no_chord=None, disable_chord=False):
+                 remaining=None, no_chord=None, disable_chord=False,
+                 no_flag=False):
     _t0 = time.perf_counter()
     try:
         return _local_decide_inner(grid, anchor, skip_open, allow_guess,
-                                   remaining, no_chord, disable_chord)
+                                   remaining, no_chord, disable_chord, no_flag)
     finally:
         _add('decide', time.perf_counter() - _t0)
 
 
 def _local_decide_inner(grid, anchor, skip_open, allow_guess, remaining,
-                        no_chord, disable_chord):
+                        no_chord, disable_chord, no_flag=False):
     """局部化决策：以锚点为中心就地推进，数字小的格子优先。
 
     用户的贪吃蛇式思路：
@@ -344,7 +373,9 @@ def _local_decide_inner(grid, anchor, skip_open, allow_guess, remaining,
             return 'chord', cell, f'chord (r{cell[0]},c{cell[1]}) 数字{grid[cell[0]][cell[1]]} 可开 {k} 格'
 
     # 2) 能推必雷就标雷（标完下一轮才能 chord）
-    if mines:
+    #    no_flag：窗口抢不到前台时插旗必然全灭（右键会打到别的窗口），
+    #    所以那种情况下直接跳过，落到下面用 UIA invoke 开确定安全格 —— 至少这一局能继续。
+    if mines and not no_flag:
         m = near(mines)
         return 'flag', m, f'确定是雷（共 {len(mines)} 个），标最近的'
 
@@ -875,10 +906,7 @@ def play_game(hwnd, dry, allow_guess, max_steps, remaining, game_no=1):
                     return 'stuck', done      # 交给外层重开（输只认弹窗）
                 time.sleep(0.5)
                 continue
-            if _mines:
-                # 插旗走真实鼠标 → 必须确认窗口真的在最前面（SetForegroundWindow 会静默失败）
-                if not ensure_ready(hwnd):
-                    print(f'[{step}] ⚠ 扫雷窗口未能置前（插旗走真实鼠标，可能失效）')
+            if _mines and _mouse_ok(hwnd, step):
                 todo = sorted(_mines)
                 print(f'[{step}] 批量标雷 {len(todo)} 个：{todo[:6]}{" ..." if len(todo) > 6 else ""}')
                 for m in todo:
@@ -934,12 +962,17 @@ def play_game(hwnd, dry, allow_guess, max_steps, remaining, game_no=1):
                 continue
 
         try:
+            # 决策前刷一次焦点状态：焦点可能在这一局中途被别的程序抢走，
+            # 不能只靠上一次 ensure_ready 的结果（否则会返回 chord/flag，
+            # 然后右键全打到别的窗口上）。抢不到就退回「只用 UIA 开格」。
+            _mouse_ok(hwnd, step)
             action, cell, reason = local_decide(grid, anchor=anchor,
                                                skip_open=failed,
                                                allow_guess=allow_guess,
                                                remaining=remaining,
                                                no_chord=failed_chord,
-                                               disable_chord=disable_chord)
+                                               disable_chord=disable_chord or not _MOUSE_OK,
+                                               no_flag=not _MOUSE_OK)
         except ValueError as exc:
             open_fail += 1
             print(f'[{step}] 盘面矛盾（{exc}），重试 {open_fail}/5')
