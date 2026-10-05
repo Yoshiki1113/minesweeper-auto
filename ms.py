@@ -59,7 +59,8 @@ def cmd_start(extra: list[str]) -> None:
         pass
 
     log = open(LOG_FILE, 'w', encoding='utf-8')
-    args = [PY, '-u', os.path.join(HERE, 'agent.py'), '--guess', '--loop', '10'] + extra
+    # 赌博现在是 agent.py 的默认行为，不用再显式传 --guess（想关是 --no-guess）
+    args = [PY, '-u', os.path.join(HERE, 'agent.py'), '--loop', '10'] + extra
     p = subprocess.Popen(args, stdout=log, stderr=subprocess.STDOUT, cwd=HERE)
     with open(PID_FILE, 'w', encoding='utf-8') as f:
         f.write(str(p.pid))

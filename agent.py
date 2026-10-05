@@ -8,13 +8,14 @@
 3. 坐标校验：每次点击前确认目标落在扫雷窗口 rect 内，否则拒绝执行。
 4. 单步限速：一次只动一格，动作后等界面刷新再重新识别，不批量连点。
 5. 步数上限 + 全程日志：每步写 log/step-*.jsonl，出事能回看。
-6. 无确定步时默认停手（不猜）；只有显式 --guess 才允许用概率枚举赌。
+6. 无确定步时**默认赌概率最低的格子**（用概率枚举挑风险最小的）；
+   想改成「停手不猜」就加 --no-guess。
 
 用法:
     python agent.py --dry            # 只算不点（先跑这个）
     python agent.py --once 5         # 实点 5 步
-    python agent.py                  # 一直点到没有确定步为止
-    python agent.py --guess          # 允许在无确定步时赌概率最低的格子
+    python agent.py                  # 一直打到赢或踩雷（无确定步就赌）
+    python agent.py --no-guess       # 无确定步就停手，不赌
 """
 from __future__ import annotations
 
@@ -352,8 +353,8 @@ def _local_decide_inner(grid, anchor, skip_open, allow_guess, remaining,
     """
     # 0) 开局首点：全新棋盘（一格未开）没有任何数字可推理，而扫雷保证首点必定安全
     #    （布雷是第一次点击之后才做的），所以直接点中心格。
-    #    ⚠️ 少了这一段，空盘会一路落到下面第 4 条「无确定步」直接停手 ——
-    #    表现就是「不加 --guess 连开局都开不了」，跟 README 的用法对不上。
+    #    ⚠️ 少了这一段，空盘会一路落到下面第 4 条「无确定步」——默认会去赌，
+    #    那就不是「必定安全的中心格」，而是拿首点去随机赌一格了。
     if sum(row.count('#') for row in grid) == ROWS * COLS:
         return 'open', (ROWS // 2, COLS // 2), '开局首点（必定安全）'
 
@@ -1133,7 +1134,12 @@ def main() -> None:
             pass
     ap = argparse.ArgumentParser()
     ap.add_argument('--dry', action='store_true', help='只算不点')
-    ap.add_argument('--guess', action='store_true', help='无确定步时允许赌概率最低格')
+    # 默认赌：高级局约有 5 次「信息不足必须猜」，不赌的话那些局面会直接停手，
+    # 观感上像卡住、也打不完一局。想改成保守模式用 --no-guess。
+    ap.add_argument('--guess', dest='guess', action='store_true', default=True,
+                    help='无确定步时赌概率最低格（默认开）')
+    ap.add_argument('--no-guess', dest='guess', action='store_false',
+                    help='无确定步就停手，不赌')
     ap.add_argument('--once', type=int, default=0, help='单局最多走 N 步（0=不限）')
     ap.add_argument('--loop', type=int, default=1, help='最多打 N 局（输了自动重开），直到赢')
     ap.add_argument('--no-uia', action='store_true', help='不用 UIA，回退像素识别')
